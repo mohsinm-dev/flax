@@ -373,23 +373,31 @@ class JitWrapped:
       out_shardings,
     )
 
-    self.jitted_fn = jax.jit(
-      JitFn(fun, in_shardings, out_shardings, kwarg_shardings, self),
-      in_shardings=self.jax_in_shardings,
-      out_shardings=(
+    # Build jax.jit arguments, conditionally omitting out_shardings when backend or device is specified
+    jit_kwargs = {
+      'in_shardings': self.jax_in_shardings,
+      'static_argnums': static_argnums,
+      'static_argnames': static_argnames,
+      'donate_argnums': donate_argnums,
+      'donate_argnames': donate_argnames,
+      'keep_unused': keep_unused,
+      'device': device,
+      'backend': backend,
+      'inline': inline,
+      'abstracted_axes': abstracted_axes,
+    }
+    
+    # Only specify out_shardings when neither backend nor device is specified
+    if device is None and backend is None:
+      jit_kwargs['out_shardings'] = (
         self.jax_in_shardings,
         kwarg_shardings,
         self.jax_out_shardings,
-      ),
-      static_argnums=static_argnums,
-      static_argnames=static_argnames,
-      donate_argnums=donate_argnums,
-      donate_argnames=donate_argnames,
-      keep_unused=keep_unused,
-      device=device,
-      backend=backend,
-      inline=inline,
-      abstracted_axes=abstracted_axes,
+      )
+    
+    self.jitted_fn = jax.jit(
+      JitFn(fun, in_shardings, out_shardings, kwarg_shardings, self),
+      **jit_kwargs
     )
     self.in_shardings = in_shardings
     self.out_shardings = out_shardings
