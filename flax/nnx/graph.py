@@ -853,7 +853,11 @@ def _graph_flatten(
         paths.append(tuple(path))  # type: ignore
       leaves.append(value)
     else:
-      attributes.append((key, Static(value)))
+      # Use StaticInitializer for initializer functions to avoid JIT recompilations
+      if isinstance(key, str) and key.endswith('_init') and callable(value):
+        attributes.append((key, StaticInitializer(value)))
+      else:
+        attributes.append((key, Static(value)))
 
     if path is not None:
       path.pop()
@@ -1282,6 +1286,8 @@ def _graph_unflatten(
     for _ in range(nodedef.num_attributes):
       key, value = next(attribute_iter)
       if type(value) is Static:
+        children.append((key, value.value))  # type: ignore[attribute-error]
+      elif type(value) is StaticInitializer:
         children.append((key, value.value))  # type: ignore[attribute-error]
       elif type(value) is MutableArrayAttr:
         array_refdef = next(node_iter)
@@ -3029,6 +3035,27 @@ class Static(tp.Generic[A]):
   """
 
   value: A
+
+
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, slots=True)
+class StaticInitializer(tp.Generic[A]):
+  """A static node for initializer functions that doesn't affect GraphDef equality.
+  
+  This is used to store initializer functions (like kernel_init, bias_init) in a way
+  that preserves them for introspection and serialization, but excludes them from
+  GraphDef structural comparison to prevent unnecessary JIT recompilations.
+  
+  ``value`` must define ``__eq__`` and ``__hash__``.
+  """
+
+  value: A
+
+  def __eq__(self, other):
+    return isinstance(other, StaticInitializer)
+
+  def __hash__(self):
+    return hash(StaticInitializer)
 
 
 # ---------------------------------------------------------
