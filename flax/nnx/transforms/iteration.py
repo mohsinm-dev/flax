@@ -25,7 +25,10 @@ from flax.nnx import extract, filterlib, graph, spmd, variablelib
 from flax.nnx import statelib
 from flax.nnx.module import Module
 from flax.nnx.statelib import State
-from flax.nnx.transforms.transforms import resolve_kwargs
+from flax.nnx.transforms.transforms import (
+  resolve_kwargs,
+  _maybe_unbind_and_rewrap_partial,
+)
 from flax.typing import Leaf, Missing, PytreeDeque
 import jax
 import jax.core
@@ -328,12 +331,20 @@ def vmap(
         spmd_axis_name=spmd_axis_name,
         transform_metadata=transform_metadata,
     )  # type: ignore[return-value]
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
+
+  eff_in_axes = in_axes
+  if bound_self is not None:
+    if isinstance(in_axes, (tuple, list)):
+      eff_in_axes = (None, *in_axes)  # type: ignore[assignment]
+    else:
+      eff_in_axes = (None, in_axes)
 
   jax_in_axes = jax.tree.map(
     lambda x: extract.NodeStates.from_prefixes(x.axes, metadata=x)
     if isinstance(x, StateAxes)
     else x,
-    in_axes,
+    eff_in_axes,
   )
   jax_out_axes = jax.tree.map(
     lambda x: extract.NodeStates.from_prefixes(x.axes, metadata=x)
@@ -342,7 +353,7 @@ def vmap(
     out_axes,
   )
   vmapped_fn = jax.vmap(
-      VmapFn(f, transform_metadata, in_axes, out_axes),
+      VmapFn(unbound_fn, transform_metadata, eff_in_axes, out_axes),
       in_axes=jax_in_axes,
       out_axes=(jax_in_axes, jax_out_axes),
       axis_name=axis_name,
@@ -353,9 +364,11 @@ def vmap(
   @functools.wraps(f)
   @graph.update_context('vmap')
   def vmap_wrapper(*args, **kwargs):
-    args = resolve_kwargs(f, args, kwargs)
+    if bound_self is not None:
+      args = (bound_self, *args)
+    args = resolve_kwargs(unbound_fn, args, kwargs)
     pure_args = extract.to_tree(
-        args, prefix=in_axes, split_fn=_vmap_split_fn, ctxtag='vmap'
+        args, prefix=eff_in_axes, split_fn=_vmap_split_fn, ctxtag='vmap'
     )
     pure_args_out, pure_out = vmapped_fn(*pure_args)
     _args_out, out = extract.from_tree(
@@ -551,11 +564,21 @@ def pmap(
         transform_metadata=transform_metadata,
     )  # type: ignore[return-value]
 
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
+
+  # If injecting a Module, it should never be sharded/mapped: prepend None.
+  eff_in_axes = in_axes
+  if bound_self is not None:
+    if isinstance(in_axes, (tuple, list)):
+      eff_in_axes = (None, *in_axes)  # type: ignore[assignment]
+    else:
+      eff_in_axes = (None, in_axes)
+
   jax_in_axes = jax.tree.map(
     lambda x: extract.NodeStates.from_prefixes(x.axes, metadata=x)
     if isinstance(x, StateAxes)
     else x,
-    in_axes,
+    eff_in_axes,
   )
   jax_out_axes = jax.tree.map(
     lambda x: extract.NodeStates.from_prefixes(x.axes, metadata=x)
@@ -563,12 +586,20 @@ def pmap(
     else x,
     out_axes,
   )
+  # Shift static_broadcasted_argnums if we inject a Module at arg0.
+  eff_static_bcast = static_broadcasted_argnums
+  if bound_self is not None:
+    if isinstance(static_broadcasted_argnums, int):
+      eff_static_bcast = static_broadcasted_argnums + 1
+    else:
+      eff_static_bcast = tuple(i + 1 for i in static_broadcasted_argnums)
+
   pmapped_fn = jax.pmap(
-      PmapFn(f, transform_metadata, in_axes, out_axes),
+      PmapFn(unbound_fn, transform_metadata, eff_in_axes, out_axes),
       axis_name=axis_name,
       in_axes=jax_in_axes,
       out_axes=(jax_in_axes, jax_out_axes),
-      static_broadcasted_argnums=static_broadcasted_argnums,
+      static_broadcasted_argnums=eff_static_bcast,
       devices=devices,
       backend=backend,
       axis_size=axis_size,
@@ -579,8 +610,10 @@ def pmap(
   @functools.wraps(f)
   @graph.update_context('pmap')
   def vmap_wrapper(*args):
+    if bound_self is not None:
+      args = (bound_self, *args)
     pure_args = extract.to_tree(
-        args, prefix=in_axes, split_fn=_vmap_split_fn, ctxtag='pmap'
+        args, prefix=eff_in_axes, split_fn=_vmap_split_fn, ctxtag='pmap'
     )
     pure_args_out, pure_out = pmapped_fn(*pure_args)
     _args_out, out = extract.from_tree(
@@ -1295,6 +1328,8 @@ def scan(
 
   _check_out_axes(out_axes)
 
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
+
   input_carry_argnum = _get_carry_argnum(in_axes, is_in_axes=True)
   output_carry_argnum = _get_carry_argnum(out_axes, is_in_axes=False)
 
@@ -1306,11 +1341,18 @@ def scan(
       f'Got {in_axes=!r} and {out_axes=!r}'
     )
 
+  eff_in_axes = in_axes
+  if bound_self is not None:
+    if isinstance(in_axes, (tuple, list)):
+      eff_in_axes = (None, *in_axes)  # type: ignore[assignment]
+    else:
+      eff_in_axes = (None, in_axes)
+
   scan_fn = ScanFn(
-    f,
+    unbound_fn,
     input_carry_argnum,
     output_carry_argnum,
-    in_axes,
+    eff_in_axes,
     out_axes,
     transform_metadata,
   )
@@ -1318,9 +1360,11 @@ def scan(
   @functools.wraps(f)
   @graph.update_context('scan')
   def scan_wrapper(*args, **kwargs):
-    args = resolve_kwargs(f, args, kwargs)
+    if bound_self is not None:
+      args = (bound_self, *args)
+    args = resolve_kwargs(unbound_fn, args, kwargs)
 
-    if in_axes is Carry and len(args) != 1:
+    if in_axes is Carry and (len(args) - (1 if bound_self is not None else 0)) != 1:
       raise ValueError(
         f'When in_axes=Carry, the function must take exactly one argument, '
         f'got {len(args)} arguments.'
@@ -1331,7 +1375,7 @@ def scan(
     broadcast_arrays = PytreeDeque()
     pure_args: tuple = extract.to_tree(
       args,
-      prefix=in_axes,
+      prefix=eff_in_axes,
       split_fn=functools.partial(
         _scan_split_in, carry_deque, broadcast_deque, broadcast_arrays
       ),

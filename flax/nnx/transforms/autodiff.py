@@ -31,7 +31,10 @@ import jax.core
 import jax.stages
 
 from flax.nnx.transforms import general
-from flax.nnx.transforms.transforms import resolve_kwargs
+from flax.nnx.transforms.transforms import (
+  resolve_kwargs,
+  _maybe_unbind_and_rewrap_partial,
+)
 from flax.typing import MISSING, Missing
 
 
@@ -315,14 +318,40 @@ def grad(
       holomorphic=holomorphic,
       allow_int=allow_int,
     )
-  return _grad_general(
-    f,
-    argnums,
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
+
+  def _shift_argnums_if_bound(
+    ans: int | DiffState | tp.Sequence[int | DiffState]
+  ) -> int | DiffState | tp.Sequence[int | DiffState]:
+    if bound_self is None:
+      return ans
+    def shift_one(x):
+      if isinstance(x, int):
+        return x + 1
+      elif isinstance(x, DiffState):
+        return dataclasses.replace(x, argnum=x.argnum + 1)
+      return x
+    if isinstance(ans, (int, DiffState)):
+      return shift_one(ans)
+    else:
+      return tuple(shift_one(x) for x in ans)
+
+  eff_argnums = _shift_argnums_if_bound(argnums)
+
+  inner = _grad_general(
+    unbound_fn,
+    eff_argnums,
     has_aux,
     holomorphic,
     allow_int,
     return_value=False,
   )
+  if bound_self is None:
+    return inner
+  @functools.wraps(f)
+  def _grad_wrapper(*args, **kwargs):
+    return inner(bound_self, *args, **kwargs)
+  return _grad_wrapper
 
 
 @tp.overload
@@ -369,14 +398,35 @@ def value_and_grad(
       holomorphic=holomorphic,
       allow_int=allow_int,
     )
-  return _grad_general(
-    f,
-    argnums,
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
+  def shift_one(x):
+    if isinstance(x, int):
+      return x + 1
+    elif isinstance(x, DiffState):
+      return dataclasses.replace(x, argnum=x.argnum + 1)
+    return x
+  if bound_self is not None:
+    if isinstance(argnums, (int, DiffState)):
+      eff_argnums = shift_one(argnums)
+    else:
+      eff_argnums = tuple(shift_one(x) for x in argnums)
+  else:
+    eff_argnums = argnums
+
+  inner = _grad_general(
+    unbound_fn,
+    eff_argnums,
     has_aux,
     holomorphic,
     allow_int,
     return_value=True,
   )
+  if bound_self is None:
+    return inner
+  @functools.wraps(f)
+  def _value_and_grad_wrapper(*args, **kwargs):
+    return inner(bound_self, *args, **kwargs)
+  return _value_and_grad_wrapper
 
 # -----------------------------------------------
 # custom_vjp
@@ -832,7 +882,30 @@ def custom_vjp(
   """
   if isinstance(fun, Missing):
     return functools.partial(custom_vjp, nondiff_argnums=nondiff_argnums)
-  return CustomVjp(fun, nondiff_argnums)
+
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(fun)
+
+  if bound_self is not None:
+    def shift_one(x):
+      if isinstance(x, int):
+        return x + 1
+      elif isinstance(x, DiffState):
+        return dataclasses.replace(x, argnum=x.argnum + 1)
+      return x
+    eff_nondiff = tuple(shift_one(x) for x in nondiff_argnums)
+  else:
+    eff_nondiff = nondiff_argnums
+
+  if bound_self is None:
+    return CustomVjp(unbound_fn, eff_nondiff)
+
+  class _BoundCustomVjp(CustomVjp[A]):
+    def __init__(self, fun: tp.Callable[..., A], nondiff):
+      super().__init__(fun, nondiff)
+    def __call__(self, *args, **kwargs):  # type: ignore[override]
+      return super().__call__(bound_self, *args, **kwargs)
+
+  return _BoundCustomVjp(unbound_fn, eff_nondiff)
 
 
 # -------------------------------
@@ -891,10 +964,7 @@ def remat(
 
   # Normalize callable: handle functools.partial and unbind bound Module
   # methods so the Module participates in split/merge and state updates.
-  from flax.nnx.transforms.transforms import (
-    _maybe_unbind_and_rewrap_partial as _normalize_callable,
-  )
-  unbound_fn, bound_self = _normalize_callable(f)
+  unbound_fn, bound_self = _maybe_unbind_and_rewrap_partial(f)
 
   # If we inject a Module ('self') at position 0, shift index-based
   # static_argnums by +1 so user intent is preserved.
@@ -921,11 +991,12 @@ def remat(
     ),
   )
 
-  if bound_self is None:
-    return inner_transform  # type: ignore[return-value]
-
   @functools.wraps(f)
-  def _bound_wrapper(*args, **kwargs):
-    return inner_transform(bound_self, *args, **kwargs)
+  def _remat_wrapper(*args, **kwargs):
+    # Inject Module first, then bind kwargs according to unbound function signature.
+    if bound_self is not None:
+      args = (bound_self, *args)
+    bound_args = resolve_kwargs(unbound_fn, args, kwargs)
+    return inner_transform(*bound_args)
 
-  return _bound_wrapper  # type: ignore[return-value]
+  return _remat_wrapper  # type: ignore[return-value]

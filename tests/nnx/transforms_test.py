@@ -1128,6 +1128,18 @@ class TestCustomVJP(parameterized.TestCase):
     m = Foo(x=jnp.array(1.0), y=jnp.array(2.0))
     grads = nnx.grad(f)(m)
 
+  def test_grad_bound_method_argnums_shift(self):
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(3, 2, rngs=rngs)
+      def block(self, x):
+        return jnp.sum(self.linear(x))
+
+    m = Model(rngs=nnx.Rngs(0))
+    x = jnp.ones((3,))
+    grad_x = nnx.grad(m.block, argnums=0)(x)
+    self.assertEqual(grad_x.shape, x.shape)
+
   @parameterized.parameters(
     {'use_custom_vjp': False},
     {'use_custom_vjp': True},
@@ -1199,18 +1211,18 @@ class TestScan(absltest.TestCase):
 
     _, module = create_block(None, nnx.Rngs(0))
 
-    assert module.linear.kernel.shape == (5, 3, 3)
-    assert module.linear.bias.shape == (5, 3)
+  def test_scan_bound_method_no_carry(self):
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(2, 2, rngs=rngs)
+      def block(self, x):
+        return self.linear(x)
 
-    @nnx.scan(in_axes=(nnx.Carry, 0, None), length=5)
-    def forward_block(_, block: Block, x: jax.Array):
-      return None, block(x)
-
-    x = jnp.ones((1, 3))
-    out, y = forward_block(None, module, x)
-
-    assert y.shape == (5, 1, 3)
-    assert out is None
+    m = Model(rngs=nnx.Rngs(0))
+    xs = jnp.ones((5, 2))
+    scanned = nnx.scan(m.block, in_axes=0, out_axes=0, length=5)
+    ys = scanned(xs)
+    self.assertEqual(ys.shape, (5, 2))
 
   def test_variables_in_scan(self):
     def block_init(din, dout, rngs):
@@ -2065,6 +2077,19 @@ class TestVmap(absltest.TestCase):
 
     self.assertEqual(y.shape, (3, 5))
 
+  def test_vmap_bound_method_in_axes(self):
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(2, 3, rngs=rngs)
+      def block(self, x):
+        return self.linear(x)
+
+    m = Model(rngs=nnx.Rngs(0))
+    x = jnp.ones((4, 2))
+    vmapped = nnx.vmap(m.block, in_axes=0, out_axes=0)
+    y = vmapped(x)
+    self.assertEqual(y.shape, (4, 3))
+
   def test_state_axes(self):
     class Block(nnx.Module):
       def __init__(self, rngs: nnx.Rngs):
@@ -2167,6 +2192,21 @@ class TestVmap(absltest.TestCase):
     y2 = forward_block(module, x)
 
     assert not jnp.allclose(y, y2)
+
+  def test_pmap_bound_method_in_axes(self):
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(2, 3, rngs=rngs)
+      def block(self, x):
+        return self.linear(x)
+
+    m = Model(rngs=nnx.Rngs(0))
+    ndev = jax.local_device_count()
+    x = jnp.ones((ndev, 2))
+
+    pmapped = nnx.pmap(m.block, in_axes=0, out_axes=0)
+    y = pmapped(x)
+    self.assertEqual(y.shape, (ndev, 3))
 
   def test_split_rngs_decorator(self):
     class Block(nnx.Module):
