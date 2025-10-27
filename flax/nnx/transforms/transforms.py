@@ -51,6 +51,46 @@ Leaves = list[Leaf]
 Index = int
 
 
+def _maybe_unbind_and_rewrap_partial(
+  f: tp.Callable[..., tp.Any],
+) -> tuple[tp.Callable[..., tp.Any], tp.Any]:
+  """Normalize a callable to an unbound function and detect bound Module.
+
+  - Unwraps nested functools.partial layers while preserving bound args/kwargs.
+  - If the base callable is a bound nnx.Module method, returns the unbound
+    function and the bound Module instance for injection by the caller.
+  - Re-applies any partial arguments to the unbound function.
+
+  Returns:
+    (normalized_fn, bound_self) where bound_self is None if not a bound Module
+    method.
+  """
+  # Local import to avoid circular deps at import time
+  from flax.nnx.module import Module  # pylint: disable=import-error,cyclic-import
+
+  # Peel off partials, collecting args/kwargs
+  partial_args: tuple = ()
+  partial_kwargs: dict[str, tp.Any] = {}
+  base = f
+  while isinstance(base, functools.partial):
+    # Prepend args to preserve left-to-right application order
+    partial_args = base.args + partial_args
+    if base.keywords:
+      # Inner-most kwargs should take precedence
+      partial_kwargs = {**base.keywords, **partial_kwargs}
+    base = base.func
+
+  bound_self = None
+  if inspect.ismethod(base) and isinstance(getattr(base, '__self__', None), Module):
+    bound_self = base.__self__  # type: ignore[attr-defined]
+    base = base.__func__  # type: ignore[attr-defined]
+
+  if partial_args or partial_kwargs:
+    base = functools.partial(base, *partial_args, **partial_kwargs)
+
+  return base, bound_self
+
+
 @tp.overload
 def resolve_kwargs(
   fun: tp.Callable[..., tp.Any],
@@ -252,4 +292,3 @@ def switch(
     [general.merge_inputs(f, ctxtag='switch') for f in branches],
     *operands,
   )
-

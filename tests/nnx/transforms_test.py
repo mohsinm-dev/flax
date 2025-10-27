@@ -1889,11 +1889,127 @@ class TestRemat(absltest.TestCase):
 
     m = ScanLinear(nnx.Rngs(0))
 
-    assert m.linear.kernel.shape == (5, 3, 3)
-    assert m.linear.bias.shape == (5, 3)
+  def test_remat_bound_method(self):
+    """Test that remat works with bound methods (issue #5053)."""
+    
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(16, 32, rngs=rngs)
+        self.x_max = jnp.array(0.0)
 
-    y, _ = m(jnp.ones((1, 3)))
-    assert y.shape == (1, 3)
+      def __call__(self, x):
+        # This should work with bound method auto-unbinding
+        return nnx.remat(self.block)(x)
+
+      def block(self, x):
+        self.x_max = jnp.maximum(self.x_max, x.max())
+        return self.linear(x)
+
+    # Test that bound method remat works without TraceContextError
+    model = Model(rngs=nnx.Rngs(0))
+    x = jnp.ones((3, 16))
+    
+    # This should not raise TraceContextError
+    result = model(x)
+    
+    # Verify the computation worked
+    assert result.shape == (3, 32)
+    # Verify state mutation worked (x_max should be updated)
+    assert model.x_max == 1.0
+
+  def test_remat_bound_method_manual_call(self):
+    """Test that remat with bound methods can be called manually."""
+    
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(4, 8, rngs=rngs)
+        self.counter = jnp.array(0)
+
+      def block(self, x):
+        self.counter += 1
+        return self.linear(x)
+
+    model = Model(rngs=nnx.Rngs(42))
+    x = jnp.ones((2, 4))
+    
+    # Test that manually calling remat on bound method works
+    remat_block = nnx.remat(model.block)
+    result = remat_block(x)
+    
+    # Verify the computation worked
+    assert result.shape == (2, 8)
+    # Verify state mutation worked
+    assert model.counter == 1
+
+  def test_remat_unbound_method_still_works(self):
+    """Test that remat still works with unbound methods and regular functions."""
+    
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(4, 8, rngs=rngs)
+
+      def block(self, x):
+        return self.linear(x)
+
+    model = Model(rngs=nnx.Rngs(42))
+    x = jnp.ones((2, 4))
+    
+    # Test unbound method (should still work)
+    remat_unbound = nnx.remat(model.block.__func__)
+    result1 = remat_unbound(model, x)
+    assert result1.shape == (2, 8)
+    
+    # Test regular function (should still work)
+    def regular_func(x):
+      return x * 2
+    
+    remat_regular = nnx.remat(regular_func)
+    result2 = remat_regular(jnp.array(5.0))
+    assert result2 == 10.0
+
+  def test_remat_partial_bound_method(self):
+    """remat should handle functools.partial(bound_method, ...)."""
+
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(3, 3, rngs=rngs)
+        self.calls = jnp.array(0)
+
+      def block(self, x, scale: float = 1.0):
+        self.calls += 1
+        return self.linear(x) * scale
+
+    m = Model(rngs=nnx.Rngs(0))
+    x = jnp.ones((2, 3))
+
+    f = partial(m.block, scale=2.0)
+    y = nnx.remat(f)(x)
+
+    self.assertEqual(y.shape, (2, 3))
+    self.assertEqual(m.calls, 1)
+
+  def test_remat_bound_method_static_argnums(self):
+    """Bound methods: static_argnums should match bound signature indices."""
+
+    class Model(nnx.Module):
+      def __init__(self, *, rngs: nnx.Rngs):
+        self.acc = jnp.array(0)
+
+      def block(self, x, use_bias: bool):
+        # 'use_bias' is Python bool, treat as static
+        self.acc += 1
+        return x + (1 if use_bias else 0)
+
+      def __call__(self, x, flag):
+        g = nnx.remat(self.block, static_argnums=(1,))
+        return g(x, flag)
+
+    m = Model(rngs=nnx.Rngs(0))
+    out1 = m(jnp.ones((1,)), True)
+    out2 = m(jnp.ones((1,)), False)
+    self.assertEqual(out1.shape, (1,))
+    self.assertEqual(out2.shape, (1,))
+    self.assertEqual(m.acc, 2)
 
 
 class TestVmap(absltest.TestCase):

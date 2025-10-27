@@ -49,6 +49,9 @@ AxisName = tp.Hashable
 # Index = int
 
 
+# NOTE: helper for unbinding bound methods lives in transforms.py to be shared
+
+
 # -------------------------------
 # grad
 # -------------------------------
@@ -872,6 +875,11 @@ def remat(
   To learn about ``jax.remat``, go to JAX's
     `fundamentals of jax.checkpoint <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#fundamentals-of-jax-checkpoint>`_
     and `practical notes <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#practical-notes>`_.
+
+  Note:
+    ``nnx.remat`` automatically handles bound methods by converting them to
+    unbound functions and injecting the module as the first argument. This
+    ensures proper state handling through NNX's split/merge pipeline.
   """
   if isinstance(f, Missing):
     return functools.partial(
@@ -881,16 +889,43 @@ def remat(
       policy=policy,
     )  # type: ignore[return-value]
 
-  return resolve_kwargs()(
-    graph.update_context('remat')(
-      general.split_inputs(
-        jax.checkpoint(
-          general.merge_inputs(f, ctxtag='remat'),
-          prevent_cse=prevent_cse,
-          static_argnums=static_argnums,
-          policy=policy,
-        ),
-        ctxtag='remat',
-      ),
-    )
+  # Normalize callable: handle functools.partial and unbind bound Module
+  # methods so the Module participates in split/merge and state updates.
+  from flax.nnx.transforms.transforms import (
+    _maybe_unbind_and_rewrap_partial as _normalize_callable,
   )
+  unbound_fn, bound_self = _normalize_callable(f)
+
+  # If we inject a Module ('self') at position 0, shift index-based
+  # static_argnums by +1 so user intent is preserved.
+  eff_static_argnums = static_argnums
+  if bound_self is not None and static_argnums:
+    if isinstance(static_argnums, int):
+      eff_static_argnums = static_argnums + 1
+    else:
+      eff_static_argnums = tuple(i + 1 for i in static_argnums)
+
+  # Resolve kwargs against the user's callable signature up front, so
+  # split_inputs/merge_inputs can operate positionally without ambiguity.
+  user_fn = resolve_kwargs()(unbound_fn)
+
+  inner_transform = graph.update_context('remat')(
+    general.split_inputs(
+      jax.checkpoint(
+        general.merge_inputs(user_fn, ctxtag='remat'),
+        prevent_cse=prevent_cse,
+        static_argnums=eff_static_argnums,
+        policy=policy,
+      ),
+      ctxtag='remat',
+    ),
+  )
+
+  if bound_self is None:
+    return inner_transform  # type: ignore[return-value]
+
+  @functools.wraps(f)
+  def _bound_wrapper(*args, **kwargs):
+    return inner_transform(bound_self, *args, **kwargs)
+
+  return _bound_wrapper  # type: ignore[return-value]
