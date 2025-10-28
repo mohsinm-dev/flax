@@ -609,9 +609,10 @@ def pmap(
 
   @functools.wraps(f)
   @graph.update_context('pmap')
-  def vmap_wrapper(*args):
+  def vmap_wrapper(*args, **kwargs):
     if bound_self is not None:
       args = (bound_self, *args)
+    args = resolve_kwargs(unbound_fn, args, kwargs)
     pure_args = extract.to_tree(
         args, prefix=eff_in_axes, split_fn=_vmap_split_fn, ctxtag='pmap'
     )
