@@ -329,5 +329,15 @@ class TestWithRngs(parameterized.TestCase):
     # Originals unchanged
     self.assertEqual(params_stream.key.shape, ())
 
+  def test_dunder_raises_attribute_error(self):
+    rngs = nnx.Rngs(default=42)
+    with self.assertRaises(AttributeError):
+      _ = rngs.__pydantic_serializer__
+    with self.assertRaises(AttributeError):
+      _ = rngs.__totally_fake__
+    with self.assertRaises(AttributeError):
+      _ = rngs.__json__
+
+
 if __name__ == '__main__':
   absltest.main()
